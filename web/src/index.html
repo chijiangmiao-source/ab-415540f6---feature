@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>规程真值维护台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-build="__BUILD_STAMP__">
+<header>
+  <h1>规程真值维护台</h1>
+  <div class="header-meta">
+    <span id="health" class="badge badge-unknown">健康:检查中…</span>
+    <span class="build">构建:__BUILD_STAMP__</span>
+  </div>
+</header>
+
+<main>
+  <section class="column">
+    <div class="panel">
+      <h2>事实 <small>唯一标识,可撤回 / 恢复</small></h2>
+      <form id="fact-form" class="inline-form">
+        <input name="id" placeholder="事实标识,如 F1" required
+               pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64">
+        <input name="label" placeholder="说明(可选)">
+        <button type="submit">添加事实</button>
+      </form>
+      <table id="fact-table">
+        <thead><tr><th>标识</th><th>说明</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint">已撤回事实:<span id="retracted-list">无</span></p>
+    </div>
+
+    <div class="panel">
+      <h2>正向规则 <small>无变量,前提全部成立即触发</small></h2>
+      <form id="rule-form" class="inline-form">
+        <input name="id" placeholder="规则标识,如 R1" required
+               pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64">
+        <input name="premises" placeholder="前提,逗号分隔,如 F1,F2" required>
+        <input name="conclusion" placeholder="结论标识,如 C" required
+               pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64">
+        <button type="submit">添加规则</button>
+      </form>
+      <details>
+        <summary>批量添加(JSON 数组,同事务原子生效)</summary>
+        <form id="batch-form">
+          <textarea name="batch" rows="4" placeholder='[{"id":"R4","premises":["X"],"conclusion":"Y"},{"id":"R5","premises":["Y"],"conclusion":"X"}]'></textarea>
+          <button type="submit">批量提交</button>
+        </form>
+      </details>
+      <table id="rule-table">
+        <thead><tr><th>标识</th><th>前提</th><th>结论</th><th>触发</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="column">
+    <div class="panel">
+      <h2>结论与完整依据</h2>
+      <div id="conclusion-list"></div>
+    </div>
+
+    <div class="panel">
+      <h2>撤回裁决与传播链</h2>
+      <div id="verdict"><p class="hint">尚未执行撤回。</p></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+# TMS 规程服务 + 一键验证。
+#   页面访问:  TMS_HOST_PORT=8080 docker compose up app
+#   一键验证:  docker compose up --exit-code-from verify --abort-on-container-exit
+services:
+  app:
+    build: .
+    command: ["python", "-m", "app.server"]
+    environment:
+      PORT: "8000"
+      TMS_DB_PATH: /data/tms.db
+      PAGE_DIR: /srv/page
+      TMS_ALLOW_RESET: "1"        # lets the verify service reset between runs
+    volumes:
+      - tms_data:/data            # conclusions & justifications survive restarts
+      - page_dist:/srv/page       # page built by the verify service
+    ports:
+      - "${TMS_HOST_PORT:-8080}:8000"   # configurable host port for the page
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/healthz',timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build: .
+    command: ["python", "-m", "verify.run"]
+    environment:
+      APP_BASE_URL: http://app:8000
+      PAGE_OUT: /srv/page
+    volumes:
+      - page_dist:/srv/page
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  tms_data:
+  page_dist:
