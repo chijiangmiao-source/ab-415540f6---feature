@@ -10,6 +10,11 @@
          last support is retracted;
        - idempotent replay, rejection of unknown facts / dangling premises /
          self-supporting loops, and inert cyclic rules;
+       - negative (absence) premises: asserting a previously absent blocker
+         invalidates the exception conclusions and their downstream nodes,
+         withdrawing the blocker restores them, and an illegal cycle that
+         contains a negative edge is rejected without polluting the
+         procedure;
   4. exit 0 when everything passed, 1 otherwise.
 """
 
@@ -227,6 +232,91 @@ def step_smoke() -> bool:
     ok &= check("cyclic rules yield no valid conclusions",
                 not conclusions["X"]["valid"]
                 and not conclusions["Y"]["valid"])
+
+    # -- negative (absence) premises: release only while a blocker is absent
+    http("POST", "/api/facts", {"id": "E1", "label": "release condition"},
+         expect=201)
+    http("POST", "/api/facts", {"id": "EBLK", "label": "blocking hazard"},
+         expect=201)
+    http("POST", "/api/facts/EBLK/retract", expect=200)  # blocker absent
+    http("POST", "/api/rules",
+         {"id": "EN",
+          "premises": ["E1", {"node": "EBLK", "polarity": "negative"}],
+          "conclusion": "EC"}, expect=201)
+    http("POST", "/api/rules",
+         {"id": "EDR", "premises": ["EC"], "conclusion": "ED"}, expect=201)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("absence exception: EC and ED valid while blocker absent",
+                conclusions["EC"]["valid"] and conclusions["ED"]["valid"])
+    en = next(r for r in state["rules"] if r["id"] == "EN")
+    ok &= check("negative premise serialised with polarity",
+                en["premises"] == ["E1",
+                                   {"node": "EBLK", "polarity": "negative"}],
+                json.dumps(en["premises"], ensure_ascii=False))
+
+    # assert the previously absent blocker -> exception conclusions fall
+    _, avert, _ = http("POST", "/api/facts/EBLK/assert", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocking assertion: EC invalid",
+                not conclusions["EC"]["valid"])
+    ok &= check("blocking assertion: downstream ED invalid",
+                not conclusions["ED"]["valid"])
+    chain = [(s["depth"], s["node"], s["cause"])
+             for s in avert["propagation"]]
+    ok &= check("blocking assertion propagation: EC then ED",
+                chain == [(0, "EC", "support-exhausted"),
+                          (1, "ED", "support-exhausted")],
+                json.dumps(chain, ensure_ascii=False))
+    broken = avert["invalidated"][0]["lost_supports"][0]["broken_premises"]
+    ok &= check("lost support names the present negative blocker",
+                broken == [{"node": "EBLK", "polarity": "negative"}],
+                json.dumps(broken, ensure_ascii=False))
+
+    # withdraw the blocker -> EC and ED are restored
+    _, rvert, _ = http("POST", "/api/facts/EBLK/retract", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocker withdrawn: EC restored",
+                conclusions["EC"]["valid"])
+    ok &= check("blocker withdrawn: ED restored",
+                conclusions["ED"]["valid"])
+
+    # a second positive support keeps EC alive even while blocked, and is
+    # not wrongly retracted when the blocker later disappears
+    http("POST", "/api/facts", {"id": "E2"}, expect=201)
+    http("POST", "/api/rules",
+         {"id": "EP", "premises": ["E2"], "conclusion": "EC"}, expect=201)
+    _, avert, _ = http("POST", "/api/facts/EBLK/assert", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocked exception: EC survives on positive support",
+                conclusions["EC"]["valid"]
+                and [i["node"] for i in avert["invalidated"]] == [])
+    http("POST", "/api/facts/EBLK/retract", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    ec = next(c for c in state["conclusions"] if c["id"] == "EC")
+    live = sorted(s["rule_id"] for s in ec["supports"]
+                  if s["status"] == "valid")
+    ok &= check("blocker withdrawn: exception support coexists with positive",
+                live == ["EN", "EP"], json.dumps(live))
+
+    # -- illegal cycle containing a negative edge rejected, procedure clean
+    rules_before = len(state["rules"])
+    status, _, _ = http("POST", "/api/rules", [
+        {"id": "RC1",
+         "premises": [{"node": "RB", "polarity": "negative"}],
+         "conclusion": "RA"},
+        {"id": "RC2", "premises": ["RA"], "conclusion": "RB"},
+    ], expect=400)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    ok &= check("negative-edge dependency cycle rejected (400)",
+                status == 400)
+    ok &= check("illegal negative cycle did not pollute procedure",
+                len(state["rules"]) == rules_before
+                and "RA" not in {c["id"] for c in state["conclusions"]}
+                and "RB" not in {c["id"] for c in state["conclusions"]})
 
     return ok
 

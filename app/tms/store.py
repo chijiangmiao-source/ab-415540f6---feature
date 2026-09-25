@@ -31,33 +31,39 @@ CREATE TABLE IF NOT EXISTS rules (
     created_at TEXT NOT NULL
 );
 
--- Reverse index: premise node -> rules that mention it.
+-- Reverse index: premise node -> rules that mention it.  `polarity` marks
+-- whether the premise must hold ('positive') or must be absent ('negative').
 CREATE TABLE IF NOT EXISTS rule_premises (
     rule_id  TEXT NOT NULL REFERENCES rules (id) ON DELETE CASCADE,
     premise  TEXT NOT NULL,
     position INTEGER NOT NULL,
+    polarity TEXT NOT NULL CHECK (polarity IN ('positive', 'negative'))
+             DEFAULT 'positive',
     PRIMARY KEY (rule_id, premise)
 );
 CREATE INDEX IF NOT EXISTS idx_rule_premises_premise
     ON rule_premises (premise);
 
--- One support row per rule firing; the complete premise set is stored with
--- it every time the rule fires.
+-- One support row per rule firing; the complete premise set (each entry
+-- carrying its polarity) is stored with it every time the rule fires.
 CREATE TABLE IF NOT EXISTS supports (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_id    TEXT NOT NULL UNIQUE REFERENCES rules (id) ON DELETE CASCADE,
     conclusion TEXT NOT NULL,
-    premises   TEXT NOT NULL,               -- JSON array, complete premise set
+    premises   TEXT NOT NULL,               -- JSON [[node, polarity], ...]
     status     TEXT NOT NULL CHECK (status IN ('valid', 'invalid')),
     fire_count INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
--- Reverse index: premise node -> supports built on it.
+-- Reverse index: premise node -> supports built on it, with the polarity the
+-- support requires for that node.
 CREATE TABLE IF NOT EXISTS support_premises (
     support_id INTEGER NOT NULL REFERENCES supports (id) ON DELETE CASCADE,
     premise    TEXT NOT NULL,
+    polarity   TEXT NOT NULL CHECK (polarity IN ('positive', 'negative'))
+               DEFAULT 'positive',
     PRIMARY KEY (support_id, premise)
 );
 CREATE INDEX IF NOT EXISTS idx_support_premises_premise
@@ -96,7 +102,36 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring databases created before polarised premises up to date."""
+        def columns(table):
+            return {r["name"] for r in self.conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+
+        if "polarity" not in columns("rule_premises"):
+            self.conn.execute(
+                "ALTER TABLE rule_premises ADD COLUMN polarity TEXT NOT NULL"
+                " DEFAULT 'positive'")
+        if "polarity" not in columns("support_premises"):
+            self.conn.execute(
+                "ALTER TABLE support_premises ADD COLUMN polarity TEXT NOT NULL"
+                " DEFAULT 'positive'")
+        # Legacy supports stored premises as a bare JSON id array; rewrite
+        # them as [node, "positive"] pairs so the polarised loader can read
+        # them uniformly.
+        rows = self.conn.execute(
+            "SELECT id, premises FROM supports").fetchall()
+        for row in rows:
+            premises = json.loads(row["premises"])
+            if premises and isinstance(premises[0], str):
+                payload = json.dumps([[node, "positive"] for node in premises],
+                                     ensure_ascii=False)
+                self.conn.execute(
+                    "UPDATE supports SET premises = ? WHERE id = ?",
+                    (payload, row["id"]))
 
     def close(self) -> None:
         with self.lock:
@@ -152,15 +187,16 @@ class Store:
     # ------------------------------------------------------------------ rules
 
     def add_rule(self, rule_id: str, premises: list, conclusion: str) -> None:
+        """Premises are (node, polarity) pairs."""
         self.conn.execute(
             "INSERT INTO rules (id, conclusion, created_at) VALUES (?, ?, ?)",
             (rule_id, conclusion, utcnow()),
         )
-        for position, premise in enumerate(premises):
+        for position, (premise, polarity) in enumerate(premises):
             self.conn.execute(
-                "INSERT INTO rule_premises (rule_id, premise, position)"
-                " VALUES (?, ?, ?)",
-                (rule_id, premise, position),
+                "INSERT INTO rule_premises (rule_id, premise, position,"
+                " polarity) VALUES (?, ?, ?, ?)",
+                (rule_id, premise, position, polarity),
             )
 
     def get_rule(self, rule_id: str):
@@ -177,9 +213,9 @@ class Store:
 
     def _rule_with_premises(self, row) -> dict:
         premises = [
-            r["premise"]
+            [r["premise"], r["polarity"]]
             for r in self.conn.execute(
-                "SELECT premise FROM rule_premises"
+                "SELECT premise, polarity FROM rule_premises"
                 " WHERE rule_id = ? ORDER BY position",
                 (row["id"],),
             ).fetchall()
@@ -205,10 +241,11 @@ class Store:
 
     def upsert_support(self, rule_id: str, conclusion: str, premises: list,
                        firing: bool) -> None:
-        """Persist a rule firing with its complete premise set."""
+        """Persist a rule firing with its complete (node, polarity) premise set."""
         now = utcnow()
         status = "valid" if firing else "invalid"
-        payload = json.dumps(list(premises), ensure_ascii=False)
+        payload = json.dumps([[node, pol] for node, pol in premises],
+                             ensure_ascii=False)
         row = self.conn.execute(
             "SELECT id, status FROM supports WHERE rule_id = ?", (rule_id,)
         ).fetchone()
@@ -239,11 +276,11 @@ class Store:
         self.conn.execute(
             "DELETE FROM support_premises WHERE support_id = ?", (support_id,)
         )
-        for premise in premises:
+        for premise, polarity in premises:
             self.conn.execute(
-                "INSERT OR IGNORE INTO support_premises (support_id, premise)"
-                " VALUES (?, ?)",
-                (support_id, premise),
+                "INSERT OR IGNORE INTO support_premises (support_id, premise,"
+                " polarity) VALUES (?, ?, ?)",
+                (support_id, premise, polarity),
             )
 
     def get_support(self, rule_id: str):

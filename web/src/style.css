@@ -123,6 +123,10 @@ th { color: var(--muted); font-weight: 600; }
 .support.valid { border-left-color: var(--ok); }
 .support.invalid { border-left-color: var(--bad); opacity: .75; }
 .support .rule { font-family: ui-monospace, monospace; color: var(--muted); }
+.premise.neg { color: var(--accent); font-weight: 600; background: var(--accent-bg);
+  border-radius: 4px; padding: 0 4px; }
+.sep { color: var(--muted); margin: 0 2px; }
+.blocked-hint { display: block; margin-top: 3px; color: var(--bad); font-size: 12px; }
 .basis-tree { margin: 4px 0 0; padding-left: 18px; }
 .basis-tree li { margin: 2px 0; }
 .fact-leaf.invalid, .fact-leaf.retracted { color: var(--bad); text-decoration: line-through; }

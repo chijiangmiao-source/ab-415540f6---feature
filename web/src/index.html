@@ -33,19 +33,20 @@
     </div>
 
     <div class="panel">
-      <h2>正向规则 <small>无变量,前提全部成立即触发</small></h2>
+      <h2>规则 <small>无变量;前提可标肯定或否定,全部满足才触发</small></h2>
       <form id="rule-form" class="inline-form">
         <input name="id" placeholder="规则标识,如 R1" required
                pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64">
-        <input name="premises" placeholder="前提,逗号分隔,如 F1,F2" required>
+        <input name="premises" placeholder="前提,逗号分隔;!B 表示否定(必须缺席),如 F1,!B" required>
         <input name="conclusion" placeholder="结论标识,如 C" required
                pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" maxlength="64">
         <button type="submit">添加规则</button>
       </form>
+      <p class="hint">前提极性:裸标识为<em>肯定</em>(须成立),以 <code>!</code> 或 <code>~</code> 开头为<em>否定</em>(该事实/结论必须缺席)。含否定边的依赖环会被拒绝。</p>
       <details>
-        <summary>批量添加(JSON 数组,同事务原子生效)</summary>
+        <summary>批量添加(JSON 数组,同事务原子生效;否定前提用 {"node":"B","polarity":"negative"})</summary>
         <form id="batch-form">
-          <textarea name="batch" rows="4" placeholder='[{"id":"R4","premises":["X"],"conclusion":"Y"},{"id":"R5","premises":["Y"],"conclusion":"X"}]'></textarea>
+          <textarea name="batch" rows="4" placeholder='[{"id":"R4","premises":["F1",{"node":"B","polarity":"negative"}],"conclusion":"Y"}]'></textarea>
           <button type="submit">批量提交</button>
         </form>
       </details>
@@ -63,8 +64,8 @@
     </div>
 
     <div class="panel">
-      <h2>撤回裁决与传播链</h2>
-      <div id="verdict"><p class="hint">尚未执行撤回。</p></div>
+      <h2>断言 / 撤回裁决与传播链</h2>
+      <div id="verdict"><p class="hint">尚未执行断言或撤回。</p></div>
     </div>
   </section>
 </main>
