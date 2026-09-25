@@ -33,6 +33,20 @@ function toast(message, isError = false) {
 const esc = (s) => String(s).replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+/* 前提极性:服务端以字符串(肯定)或 {"id","polarity":"neg"}(否定)下发 */
+const normPremise = (p) => (p && typeof p === "object")
+  ? { id: p.id, negated: p.polarity === "neg" || p.negated === true }
+  : { id: p, negated: false };
+
+const fmtPremise = (p) => {
+  const { id, negated } = normPremise(p);
+  return negated
+    ? `<span class="premise-neg mono" title="否定前提:该节点缺席时条件才成立">¬${esc(id)}</span>`
+    : `<span class="mono">${esc(id)}</span>`;
+};
+
+const fmtPremises = (premises) => premises.map(fmtPremise).join(" ∧ ");
+
 /* ------------------------------------------------------------- 健康检查 */
 
 async function refreshHealth() {
@@ -54,7 +68,8 @@ async function refreshState() {
   renderFacts(state);
   renderRules(state);
   renderConclusions(state);
-  if (state.last_event && state.last_event.type === "fact_retracted") {
+  if (state.last_event && (state.last_event.type === "fact_retracted"
+      || state.last_event.type === "fact_asserted")) {
     renderVerdict(state.last_event.payload, true);
   }
 }
@@ -86,11 +101,16 @@ function renderRules(state) {
   tbody.innerHTML = "";
   for (const rule of state.rules) {
     const tr = document.createElement("tr");
-    const firing = rule.firing
-      ? '<span class="badge badge-ok">触发中</span>'
-      : '<span class="badge badge-unknown">未触发</span>';
+    let firing;
+    if (rule.firing) {
+      firing = '<span class="badge badge-ok">触发中</span>';
+    } else if (rule.blocked_by && rule.blocked_by.length) {
+      firing = `<span class="badge badge-warn">被 ${esc(rule.blocked_by.join(", "))} 阻断</span>`;
+    } else {
+      firing = '<span class="badge badge-unknown">未触发</span>';
+    }
     tr.innerHTML = `<td class="mono">${esc(rule.id)}</td>
-      <td class="mono">${esc(rule.premises.join(" ∧ "))}</td>
+      <td class="mono">${fmtPremises(rule.premises)}</td>
       <td class="mono">${esc(rule.conclusion)}</td><td>${firing}</td>`;
     tbody.appendChild(tr);
   }
@@ -118,7 +138,7 @@ function renderConclusions(state) {
         ? '<span class="badge badge-ok">完整支持</span>'
         : '<span class="badge badge-bad">支持已破</span>';
       return `<div class="${cls}"><span class="rule">${esc(s.rule_id)}</span>
-        ← <span class="mono">${esc(s.premises.join(" ∧ "))}</span> ${mark}</div>`;
+        ← <span class="mono">${fmtPremises(s.premises)}</span> ${mark}</div>`;
     }).join("");
     div.innerHTML = `<div class="conclusion-head">
         <span class="node">${esc(concl.id)}</span>${badge}
@@ -132,16 +152,21 @@ function renderConclusions(state) {
 
 /* 递归渲染一条结论的完整可复算依据树 */
 function renderBasisTree(node) {
+  const neg = node.polarity === "neg";
+  const name = neg ? `¬${esc(node.node)}` : esc(node.node);
+  const negBadge = neg
+    ? ` <span class="badge ${node.premise_met ? "badge-ok" : "badge-warn"}">否定前提·${node.premise_met ? "已确认缺席" : "未缺席·阻断中"}</span>`
+    : "";
   if (node.kind === "fact") {
     const cls = node.status === "asserted" ? "fact-leaf asserted"
                                           : "fact-leaf retracted";
     const tag = node.status === "asserted" ? "事实·有效" : "事实·已撤回";
-    return `<li><span class="${cls} mono">${esc(node.node)}</span>
-      <span class="hint">(${tag}${node.label ? "·" + esc(node.label) : ""})</span></li>`;
+    return `<li><span class="${cls} mono">${name}</span>
+      <span class="hint">(${tag}${node.label ? "·" + esc(node.label) : ""})</span>${negBadge}</li>`;
   }
   if (node.cyclic) {
-    return `<li><span class="mono">${esc(node.node)}</span>
-      <span class="badge badge-warn">循环支持,不计入依据</span></li>`;
+    return `<li><span class="mono">${name}</span>
+      <span class="badge badge-warn">循环支持,不计入依据</span>${negBadge}</li>`;
   }
   const items = node.supports.map((s) => {
     const children = s.premises.map(renderBasisTree).join("");
@@ -154,7 +179,7 @@ function renderBasisTree(node) {
   const badge = node.valid
     ? '<span class="badge badge-ok">有效</span>'
     : '<span class="badge badge-bad">已失效</span>';
-  return `<li><span class="mono">${esc(node.node)}</span> ${badge}
+  return `<li><span class="mono">${name}</span> ${badge}${negBadge}
     <ul class="basis-tree">${items}</ul></li>`;
 }
 
@@ -162,16 +187,18 @@ function renderBasisTree(node) {
 
 function renderVerdict(verdict, isReplay = false) {
   const host = $("#verdict");
+  const isAssert = verdict.verdict === "asserted";
   const invalidated = verdict.invalidated || [];
   const retained = verdict.retained || [];
   const propagation = verdict.propagation || [];
+  const restored = verdict.restored || [];
 
   const invalidatedHtml = invalidated.length
     ? invalidated.map((item) => {
         const lost = item.lost_supports.map((s) =>
           `<div class="support invalid"><span class="rule">${esc(s.rule_id)}</span>
-           ← <span class="mono">${esc(s.premises.join(" ∧ "))}</span>
-           (断裂前提:<span class="broken mono">${esc(s.broken_premises.join(", "))}</span>)</div>`
+           ← <span class="mono">${fmtPremises(s.premises)}</span>
+           (断裂前提:${fmtPremises(s.broken_premises)})</div>`
         ).join("");
         return `<div><span class="mono">${esc(item.node)}</span>
           <span class="badge badge-bad">已失效</span>${lost}</div>`;
@@ -182,7 +209,7 @@ function renderVerdict(verdict, isReplay = false) {
     ? retained.map((item) => {
         const rest = item.remaining_supports.map((s) =>
           `<div class="support valid"><span class="rule">${esc(s.rule_id)}</span>
-           ← <span class="mono">${esc(s.premises.join(" ∧ "))}</span>
+           ← <span class="mono">${fmtPremises(s.premises)}</span>
            <span class="badge badge-ok">剩余完整依据</span></div>`
         ).join("");
         return `<div><span class="mono">${esc(item.node)}</span>
@@ -190,21 +217,35 @@ function renderVerdict(verdict, isReplay = false) {
       }).join("")
     : "";
 
+  const restoredHtml = restored.length
+    ? `<h3>恢复有效的结论</h3><p class="mono">${esc(restored.join(", "))}</p>`
+    : "";
+
+  const causes = {
+    "support-exhausted": "支持耗尽",
+    "negative-premise-blocked": "否定前提被阻断",
+    "cyclic-support-collapsed": "循环支持坍塌",
+  };
   const chainHtml = propagation.length
     ? `<ol class="chain">${propagation.map((step) =>
         `<li class="${step.cause === "cyclic-support-collapsed" ? "cyclic" : ""}">
           <span class="depth">第 ${step.depth + 1} 层</span>
           <span class="mono">${esc(step.node)}</span> —
-          ${step.cause === "support-exhausted" ? "支持耗尽" : "循环支持坍塌"}
+          ${causes[step.cause] || esc(step.cause)}${
+            step.blocked_by && step.blocked_by.length
+              ? `(阻断者:<span class="mono">${esc(step.blocked_by.join(", "))}</span>)`
+              : ""
+          }
         </li>`).join("")}</ol>`
-    : '<p class="hint">本次撤回未形成失效传播。</p>';
+    : '<p class="hint">本次操作未形成失效传播。</p>';
 
   host.innerHTML = `<div class="verdict-block">
-    <h3>撤回 <span class="mono">${esc(verdict.fact_id)}</span>
+    <h3>${isAssert ? "断言/恢复" : "撤回"} <span class="mono">${esc(verdict.fact_id)}</span>
       ${isReplay ? '<span class="badge badge-warn">历史裁决回放</span>' : ""}
-      ${verdict.replayed ? '<span class="badge badge-warn">重复撤回·返回既有裁决</span>' : ""}
+      ${verdict.replayed ? `<span class="badge badge-warn">重复${isAssert ? "断言" : "撤回"}·返回既有裁决</span>` : ""}
     </h3>
     <p class="hint">裁决时间:${esc(verdict.at || "")}</p>
+    ${restoredHtml}
     <h3>受影响结论(失效)</h3>${invalidatedHtml}
     ${retainedHtml ? `<h3>保持有效的结论及剩余依据</h3>${retainedHtml}` : ""}
     <h3>传播链</h3>${chainHtml}
@@ -232,9 +273,15 @@ document.addEventListener("click", async (event) => {
 
   if (target.dataset.assert) {
     try {
-      await api(`/api/facts/${encodeURIComponent(target.dataset.assert)}/assert`,
-                { method: "POST" });
-      toast(`已恢复 ${target.dataset.assert}`);
+      const verdict = await api(
+        `/api/facts/${encodeURIComponent(target.dataset.assert)}/assert`,
+        { method: "POST" });
+      renderVerdict(verdict);
+      const invalidated = (verdict.invalidated || []).length;
+      toast(verdict.replayed
+        ? `事实 ${verdict.fact_id} 此前已断言。`
+        : `已断言 ${verdict.fact_id}:恢复结论 ${(verdict.restored || []).length} 个,`
+          + `失效 ${invalidated} 个。`);
       await refreshState();
     } catch (e) { toast(`恢复失败:${e.message}`, true); }
   }
@@ -271,8 +318,11 @@ $("#fact-form").addEventListener("submit", async (event) => {
 $("#rule-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
+  // 否定前提用 ! 前缀录入,如 F1,!B —— 仅当 B 缺席时规则才触发。
   const premises = form.premises.value.split(",").map((s) => s.trim())
-    .filter(Boolean);
+    .filter(Boolean).map((token) => (token.startsWith("!") || token.startsWith("¬"))
+      ? { id: token.slice(1).trim(), polarity: "neg" }
+      : token);
   try {
     await api("/api/rules", { method: "POST",
       body: { id: form.id.value.trim(), premises,

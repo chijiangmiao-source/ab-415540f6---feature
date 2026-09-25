@@ -10,6 +10,12 @@
          last support is retracted;
        - idempotent replay, rejection of unknown facts / dangling premises /
          self-supporting loops, and inert cyclic rules;
+       - negative premises: a blocker fact gates a rule while asserted,
+         withdrawing it lets the negative support coexist with the two
+         positive ones, re-asserting it invalidates the dependent
+         conclusion and its downstream (with a named blocker in the
+         propagation chain), and dependency cycles through negation are
+         rejected without polluting the procedure;
   4. exit 0 when everything passed, 1 otherwise.
 """
 
@@ -227,6 +233,120 @@ def step_smoke() -> bool:
     ok &= check("cyclic rules yield no valid conclusions",
                 not conclusions["X"]["valid"]
                 and not conclusions["Y"]["valid"])
+
+    ok &= step_negative_premises(http, check)
+
+    return ok
+
+
+def step_negative_premises(http, check) -> bool:
+    """Blocker fact B gates a release: C also gains a negative support,
+    E requires C ∧ ¬B, G depends on E."""
+    ok = True
+
+    # Bring F1 back (F2 stays retracted) and declare the gate procedure.
+    http("POST", "/api/facts/F1/assert", expect=200)
+    http("POST", "/api/facts", {"id": "B", "label": "blocker"}, expect=201)
+    http("POST", "/api/rules", {
+        "id": "RN", "premises": ["F1", {"id": "B", "polarity": "neg"}],
+        "conclusion": "C"}, expect=201)
+    http("POST", "/api/rules", {
+        "id": "RE", "premises": ["C", {"id": "B", "polarity": "neg"}],
+        "conclusion": "E"}, expect=201)
+    http("POST", "/api/rules",
+         {"id": "RG", "premises": ["E"], "conclusion": "G"}, expect=201)
+
+    _, state, _ = http("GET", "/api/state", expect=200)
+    rules = {r["id"]: r for r in state["rules"]}
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocker asserted: C valid on the positive support only",
+                conclusions["C"]["valid"] and not conclusions["E"]["valid"]
+                and not conclusions["G"]["valid"])
+    ok &= check("blocked negative premise surfaced on the rule",
+                rules["RE"]["blocked_by"] == ["B"]
+                and rules["RE"]["premises"]
+                == ["C", {"id": "B", "polarity": "neg"}],
+                json.dumps(rules["RE"], ensure_ascii=False))
+
+    # Withdraw the blocker: negative support fires and coexists with R1.
+    _, verdict, _ = http("POST", "/api/facts/B/retract", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocker withdrawn: E and G restored",
+                conclusions["E"]["valid"] and conclusions["G"]["valid"]
+                and conclusions["C"]["valid"])
+    ok &= check("withdrawal verdict reports restored E, G",
+                verdict.get("restored") == ["E", "G"]
+                and verdict["invalidated"] == [])
+    live = sorted(s["rule_id"] for s in conclusions["C"]["supports"]
+                  if s["status"] == "valid")
+    ok &= check("negative support coexists with positive support of C",
+                live == ["R1", "RN"], json.dumps(live))
+    _, tree, _ = http("GET", "/api/conclusions/E/justification", expect=200)
+    neg = [p for p in tree["supports"][0]["premises"]
+           if p.get("polarity") == "neg"]
+    ok &= check("justification shows B as confirmed-absent negative premise",
+                len(neg) == 1 and neg[0]["node"] == "B"
+                and neg[0]["premise_met"] is True)
+
+    # Re-assert the blocker: dependent conclusions fall; C survives.
+    _, verdict, _ = http("POST", "/api/facts/B/assert", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocker asserted: E and G invalidated, C retained",
+                not conclusions["E"]["valid"]
+                and not conclusions["G"]["valid"]
+                and conclusions["C"]["valid"])
+    ok &= check("assertion verdict lists invalidated E then G",
+                [i["node"] for i in verdict["invalidated"]] == ["E", "G"],
+                json.dumps(verdict["invalidated"], ensure_ascii=False))
+    broken = verdict["invalidated"][0]["lost_supports"][0]["broken_premises"]
+    ok &= check("lost support names the negative premise as broken",
+                broken == [{"id": "B", "polarity": "neg"}])
+    chain = [(s["depth"], s["node"], s["cause"], s.get("blocked_by"))
+             for s in verdict["propagation"]]
+    ok &= check("propagation names the blocker at the first wave",
+                chain == [(0, "E", "negative-premise-blocked", ["B"]),
+                          (1, "G", "support-exhausted", None)],
+                json.dumps(chain, ensure_ascii=False))
+    live = sorted(s["rule_id"] for s in conclusions["C"]["supports"]
+                  if s["status"] == "valid")
+    ok &= check("C was not wrongly retracted: R1 remains its live support",
+                live == ["R1"], json.dumps(live))
+
+    # Withdraw the blocker again: the dependent conclusions recover and the
+    # negative support coexists with the positive one once more.
+    _, verdict, _ = http("POST", "/api/facts/B/retract", expect=200)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("blocker withdrawn again: E, G restored",
+                conclusions["E"]["valid"] and conclusions["G"]["valid"])
+    live = sorted(s["rule_id"] for s in conclusions["C"]["supports"]
+                  if s["status"] == "valid")
+    ok &= check("both supports of C live again after withdrawal",
+                live == ["R1", "RN"], json.dumps(live))
+    # Repeated withdrawal replays the same verdict.
+    _, replay, _ = http("POST", "/api/facts/B/retract", expect=200)
+    ok &= check("repeated blocker withdrawal replays verdict",
+                replay["replayed"] is True
+                and replay.get("restored") == verdict.get("restored"))
+
+    # Illegal cycles through negation are rejected and never persisted.
+    rules_before = len(state["rules"])
+    status, _, _ = http("POST", "/api/rules", [
+        {"id": "RC1", "premises": [{"id": "D", "polarity": "neg"}],
+         "conclusion": "W"},
+        {"id": "RC2", "premises": ["W"], "conclusion": "D"},
+    ], expect=400)
+    status2, _, _ = http("POST", "/api/rules", {
+        "id": "RBADN", "premises": [{"id": "GHOST", "polarity": "neg"}],
+        "conclusion": "Z"}, expect=400)
+    _, state, _ = http("GET", "/api/state", expect=200)
+    ok &= check("negative-cycle and dangling-negative rules rejected",
+                status == 400 and status2 == 400)
+    ok &= check("illegal negations did not pollute the procedure",
+                len(state["rules"]) == rules_before
+                and not {"W", "Z"} & {c["id"] for c in state["conclusions"]})
 
     return ok
 

@@ -31,11 +31,14 @@ CREATE TABLE IF NOT EXISTS rules (
     created_at TEXT NOT NULL
 );
 
--- Reverse index: premise node -> rules that mention it.
+-- Reverse index: premise node -> rules that mention it.  Polarity marks
+-- negated premises (negation as absence); existing databases gain the
+-- column through the migration in Store.__init__.
 CREATE TABLE IF NOT EXISTS rule_premises (
     rule_id  TEXT NOT NULL REFERENCES rules (id) ON DELETE CASCADE,
     premise  TEXT NOT NULL,
     position INTEGER NOT NULL,
+    polarity TEXT NOT NULL DEFAULT 'pos' CHECK (polarity IN ('pos', 'neg')),
     PRIMARY KEY (rule_id, premise)
 );
 CREATE INDEX IF NOT EXISTS idx_rule_premises_premise
@@ -96,7 +99,20 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring databases created by older versions up to date."""
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(rule_premises)")
+        }
+        if "polarity" not in columns:
+            self.conn.execute(
+                "ALTER TABLE rule_premises"
+                " ADD COLUMN polarity TEXT NOT NULL DEFAULT 'pos'"
+            )
 
     def close(self) -> None:
         with self.lock:
@@ -152,15 +168,16 @@ class Store:
     # ------------------------------------------------------------------ rules
 
     def add_rule(self, rule_id: str, premises: list, conclusion: str) -> None:
+        """Store a rule; `premises` is a list of (node, polarity) pairs."""
         self.conn.execute(
             "INSERT INTO rules (id, conclusion, created_at) VALUES (?, ?, ?)",
             (rule_id, conclusion, utcnow()),
         )
-        for position, premise in enumerate(premises):
+        for position, (premise, polarity) in enumerate(premises):
             self.conn.execute(
-                "INSERT INTO rule_premises (rule_id, premise, position)"
-                " VALUES (?, ?, ?)",
-                (rule_id, premise, position),
+                "INSERT INTO rule_premises (rule_id, premise, position,"
+                " polarity) VALUES (?, ?, ?, ?)",
+                (rule_id, premise, position, polarity),
             )
 
     def get_rule(self, rule_id: str):
@@ -177,9 +194,9 @@ class Store:
 
     def _rule_with_premises(self, row) -> dict:
         premises = [
-            r["premise"]
+            (r["premise"], r["polarity"])
             for r in self.conn.execute(
-                "SELECT premise FROM rule_premises"
+                "SELECT premise, polarity FROM rule_premises"
                 " WHERE rule_id = ? ORDER BY position",
                 (row["id"],),
             ).fetchall()
@@ -205,10 +222,21 @@ class Store:
 
     def upsert_support(self, rule_id: str, conclusion: str, premises: list,
                        firing: bool) -> None:
-        """Persist a rule firing with its complete premise set."""
+        """Persist a rule firing with its complete premise set.
+
+        `premises` is a list of (node, polarity) pairs; it is stored as a
+        JSON array where positive premises stay plain id strings and
+        negated premises become {"id": ..., "polarity": "neg"} objects, so
+        databases written before polarity existed remain readable.
+        """
         now = utcnow()
         status = "valid" if firing else "invalid"
-        payload = json.dumps(list(premises), ensure_ascii=False)
+        payload = json.dumps(
+            [node if polarity == "pos"
+             else {"id": node, "polarity": "neg"}
+             for node, polarity in premises],
+            ensure_ascii=False,
+        )
         row = self.conn.execute(
             "SELECT id, status FROM supports WHERE rule_id = ?", (rule_id,)
         ).fetchone()
@@ -239,7 +267,7 @@ class Store:
         self.conn.execute(
             "DELETE FROM support_premises WHERE support_id = ?", (support_id,)
         )
-        for premise in premises:
+        for premise, _polarity in premises:
             self.conn.execute(
                 "INSERT OR IGNORE INTO support_premises (support_id, premise)"
                 " VALUES (?, ?)",
@@ -259,10 +287,20 @@ class Store:
         return [self._support_dict(r) for r in rows]
 
     def _support_dict(self, row) -> dict:
+        # Premises are stored as a JSON array of id strings (positive) and
+        # {"id", "polarity"} objects (negated); normalise to (node,
+        # polarity) pairs for the engine.  Plain-string arrays written
+        # before polarity existed read back as all-positive.
+        premises = []
+        for item in json.loads(row["premises"]):
+            if isinstance(item, dict):
+                premises.append((item["id"], item.get("polarity", "pos")))
+            else:
+                premises.append((item, "pos"))
         return {
             "rule_id": row["rule_id"],
             "conclusion": row["conclusion"],
-            "premises": json.loads(row["premises"]),
+            "premises": premises,
             "status": row["status"],
             "fire_count": row["fire_count"],
         }

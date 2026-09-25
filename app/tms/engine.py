@@ -1,13 +1,27 @@
-"""Justification-based truth-maintenance engine over ground positive rules.
+"""Justification-based truth-maintenance engine over ground rules.
+
+Rules are ground (variable-free) and forward-chaining, but each premise
+carries a *polarity*:
+
+- a positive premise must hold (the node is valid);
+- a negative premise expresses an exception — it is satisfied by the
+  *absence* of the referenced node (the node is invalid/unknown).  This is
+  negation as absence, so a rule can read "release only when the blocking
+  fact has *not* been asserted".
 
 Semantics: a conclusion is valid iff it belongs to the *least fixed point*
-of the rules over the currently asserted facts.  Consequently cyclic rules
-never conjure validity out of thin air — a support loop with no ground fact
-under it collapses as soon as its last external support is retracted.
+of the rules over the currently asserted facts under stratified negation.
+Consequently cyclic rules never conjure validity out of thin air, and rules
+whose dependency graph contains a cycle *through a negative edge* are
+rejected at submission time — such a program has no well-founded layering.
+Asserting the formerly absent blocker invalidates everything that relied on
+its absence; withdrawing the blocker restores the conclusions whose other
+premises still hold, alongside their pre-existing positive supports.
 
-Every rule firing persists its complete premise set (`supports` table), and
-retraction propagates through the reverse index (`rule_premises`) inside the
-same persistent transaction as the fact status flip.
+Every rule firing persists its complete premise set with polarities
+(`supports` table), and retraction propagates through the reverse index
+(`rule_premises`) inside the same persistent transaction as the fact status
+flip.
 """
 
 from __future__ import annotations
@@ -17,6 +31,7 @@ import re
 from .store import Store, utcnow
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
+POLARITIES = ("pos", "neg")
 
 
 class TmsError(Exception):
@@ -56,6 +71,44 @@ def _check_id(kind: str, value) -> str:
     return value
 
 
+def _parse_premise(raw):
+    """Normalise a premise spec to a (node, polarity) pair.
+
+    Accepted forms: a plain node id string (positive), or an object
+    {"id": ..., "polarity": "pos"|"neg"} ("positive"/"negative" also
+    accepted).  A negative premise is the exception condition of the
+    procedure: it is satisfied exactly while the node is absent.
+    """
+    if isinstance(raw, dict):
+        node = _check_id("premise", raw.get("id"))
+        polarity = raw.get("polarity", "pos")
+        if not isinstance(polarity, str):
+            raise ValidationFailed(
+                f"premise polarity must be a string, got {polarity!r}"
+            )
+        polarity = {"positive": "pos", "negative": "neg"}.get(
+            polarity, polarity)
+        if polarity not in POLARITIES:
+            raise ValidationFailed(
+                f"premise polarity must be one of {POLARITIES},"
+                f" got {polarity!r}"
+            )
+        return node, polarity
+    return _check_id("premise", raw), "pos"
+
+
+def _wire_premise(premise: str, polarity: str):
+    """Wire form of a premise: plain string for positive premises (the
+    historical shape), an object only when the premise is negated."""
+    if polarity == "neg":
+        return {"id": premise, "polarity": "neg"}
+    return premise
+
+
+def _wire_premises(premises) -> list:
+    return [_wire_premise(p, pol) for p, pol in premises]
+
+
 class Engine:
     def __init__(self, db_path: str):
         self.store = Store(db_path)
@@ -90,6 +143,11 @@ class Engine:
         same batch (this is how multi-rule cycles can be declared).  Any
         failure aborts the whole transaction so the procedure is never
         polluted by a partial write.
+
+        Premises carry polarity.  Positive cycles are legal (they simply
+        derive nothing until grounded); a dependency cycle that passes
+        through a *negative* edge is rejected, because stratified negation
+        has no well-founded layering for it.
         """
         if isinstance(specs, dict):
             specs = [specs]
@@ -115,11 +173,19 @@ class Engine:
                     f"rule {rule_id!r}: premises must be a non-empty list"
                 )
             normalised = []
+            polarities = {}
             for premise in premises:
-                premise = _check_id("premise", premise)
-                if premise not in normalised:
-                    normalised.append(premise)
-            if conclusion in normalised:
+                node, polarity = _parse_premise(premise)
+                if node in polarities:
+                    if polarities[node] != polarity:
+                        raise ValidationFailed(
+                            f"rule {rule_id!r}: premise {node!r} listed"
+                            f" both positively and negatively"
+                        )
+                    continue
+                polarities[node] = polarity
+                normalised.append((node, polarity))
+            if conclusion in polarities:
                 raise ValidationFailed(
                     f"rule {rule_id!r}: self-supporting loop rejected"
                     f" ({conclusion!r} supports itself)"
@@ -137,12 +203,13 @@ class Engine:
                         f"rule {rule_id!r}: conclusion {conclusion!r}"
                         f" collides with an existing fact"
                     )
-                for premise in premises:
+                for premise, _polarity in premises:
                     if premise not in known_nodes:
                         raise ValidationFailed(
                             f"rule {rule_id!r}: premise {premise!r} refers"
                             f" to an unknown fact or conclusion"
                         )
+            self._check_negative_cycles(parsed)
 
             added = []
             for rule_id, premises, conclusion in parsed:
@@ -155,7 +222,7 @@ class Engine:
                     rule_id, conclusion, premises, firing=False
                 )
                 added.append(
-                    {"id": rule_id, "premises": premises,
+                    {"id": rule_id, "premises": _wire_premises(premises),
                      "conclusion": conclusion}
                 )
 
@@ -167,6 +234,54 @@ class Engine:
                 "rules_added", {"rules": added, "derived": sorted(set(derived))}
             )
         return {"added": added, "derived": sorted(set(derived))}
+
+    def _check_negative_cycles(self, parsed) -> None:
+        """Reject dependency cycles that pass through a negative edge.
+
+        Nodes are facts/conclusions; every premise contributes a directed
+        edge conclusion -> premise (a dependency).  A cycle containing at
+        least one negative edge makes stratified evaluation impossible, so
+        the batch is refused before anything is persisted.  Purely positive
+        cycles remain legal.
+        """
+        edges = {}
+
+        def add_edge(source, target, polarity):
+            edges.setdefault(source, []).append((target, polarity))
+
+        for rule in self.store.list_rules():
+            for premise, polarity in rule["premises"]:
+                add_edge(rule["conclusion"], premise, polarity)
+        for _rule_id, premises, conclusion in parsed:
+            for premise, polarity in premises:
+                add_edge(conclusion, premise, polarity)
+
+        # For every negative edge u -> v, check whether v can still reach u
+        # through the dependency graph; if so the edge closes a cycle that
+        # includes a negative edge.
+        for source, targets in edges.items():
+            for target, polarity in targets:
+                if polarity != "neg":
+                    continue
+                if self._reaches(edges, target, source):
+                    raise ValidationFailed(
+                        f"negative premise {target!r} of conclusion"
+                        f" {source!r} closes a dependency cycle through"
+                        f" negation; stratified evaluation impossible"
+                    )
+
+    @staticmethod
+    def _reaches(edges, start, goal) -> bool:
+        stack, seen = [start], set()
+        while stack:
+            node = stack.pop()
+            if node == goal:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(target for target, _ in edges.get(node, ()))
+        return False
 
     def retract_fact(self, fact_id) -> dict:
         fact_id = _check_id("fact", fact_id)
@@ -185,7 +300,7 @@ class Engine:
             self.store.set_fact_status(fact_id, "retracted")
             newly_valid, newly_invalid = self._recompute([fact_id])
             verdict = self._build_retraction_verdict(
-                fact_id, before, newly_invalid
+                fact_id, before, newly_valid, newly_invalid
             )
             self.store.set_fact_verdict(fact_id, verdict)
             self.store.record_event("fact_retracted", verdict)
@@ -201,14 +316,22 @@ class Engine:
             if fact["status"] == "asserted":
                 return {"fact_id": fact_id, "verdict": "asserted",
                         "restored": [], "replayed": True}
+            before = self._candidate_snapshot(fact_id)
             self.store.set_fact_status(fact_id, "asserted")
-            newly_valid, _ = self._recompute([fact_id])
+            newly_valid, newly_invalid = self._recompute([fact_id])
             verdict = {
                 "fact_id": fact_id,
                 "verdict": "asserted",
                 "restored": sorted(newly_valid),
                 "at": utcnow(),
             }
+            if newly_invalid:
+                # Asserting a blocking fact knocks out every conclusion
+                # that relied on its absence, plus their downstream.
+                verdict["invalidated"] = self._invalidated_details(
+                    before, newly_invalid
+                )
+                verdict["propagation"] = self._propagation_chain(newly_invalid)
             self.store.record_event("fact_asserted", verdict)
             verdict["replayed"] = False
             return verdict
@@ -229,18 +352,27 @@ class Engine:
             rules = []
             for rule in self.store.list_rules():
                 support = self.store.get_support(rule["id"])
-                rules.append({
+                entry = {
                     "id": rule["id"],
-                    "premises": rule["premises"],
+                    "premises": _wire_premises(rule["premises"]),
                     "conclusion": rule["conclusion"],
                     "firing": bool(support and support["status"] == "valid"),
-                })
+                }
+                blocked = [p for p, pol in rule["premises"]
+                           if pol == "neg" and self.store.node_valid(p)]
+                if blocked:
+                    # Negative premises currently present, hence blocking.
+                    entry["blocked_by"] = sorted(blocked)
+                rules.append(entry)
             conclusions = []
             for node in self.store.list_conclusions():
                 conclusions.append({
                     "id": node["id"],
                     "valid": node["valid"],
-                    "supports": self.store.supports_for_conclusion(node["id"]),
+                    "supports": [
+                        self._wire_support(s)
+                        for s in self.store.supports_for_conclusion(node["id"])
+                    ],
                 })
             return {
                 "facts": facts,
@@ -313,6 +445,10 @@ class Engine:
         Only conclusions downstream of the seeds can change validity; their
         new validity is the least fixed point over the candidate subgraph
         with out-of-candidate premises pinned to their stored validity.
+        Because cycles through negation are rejected at submission time,
+        the candidate subgraph is stratifiable: it is evaluated one strongly
+        connected component at a time (dependencies first), so a negative
+        premise is always read after its node has reached its final value.
         Returns (newly_valid, newly_invalid).
         """
         candidates = self._candidates(seeds)
@@ -325,22 +461,26 @@ class Engine:
         rules = [r for r in self.store.list_rules()
                  if r["conclusion"] in candidates]
 
-        def premise_ok(premise, valid_set):
+        def premise_met(premise, polarity, valid_set):
             if premise in candidates:
-                return premise in valid_set
-            return self.store.node_valid(premise)
+                value = premise in valid_set
+            else:
+                value = self.store.node_valid(premise)
+            return value if polarity == "pos" else not value
 
         valid_set = set()
-        changed = True
-        while changed:
-            changed = False
-            for rule in rules:
-                conclusion = rule["conclusion"]
-                if conclusion in valid_set:
-                    continue
-                if all(premise_ok(p, valid_set) for p in rule["premises"]):
-                    valid_set.add(conclusion)
-                    changed = True
+        for stratum in self._stratify(candidates, rules):
+            members = set(stratum)
+            changed = True
+            while changed:
+                changed = False
+                for rule in rules:
+                    conclusion = rule["conclusion"]
+                    if conclusion in members and conclusion not in valid_set:
+                        if all(premise_met(p, pol, valid_set)
+                               for p, pol in rule["premises"]):
+                            valid_set.add(conclusion)
+                            changed = True
 
         newly_valid, newly_invalid = [], []
         for node in sorted(candidates):
@@ -354,60 +494,151 @@ class Engine:
         # whose conclusion could have changed.
         for rule in rules:
             firing = all(
-                (p in valid_set) if p in candidates
-                else self.store.node_valid(p)
-                for p in rule["premises"]
+                premise_met(p, pol, valid_set) for p, pol in rule["premises"]
             )
             self.store.upsert_support(
                 rule["id"], rule["conclusion"], rule["premises"], firing
             )
         return newly_valid, newly_invalid
 
-    def _build_retraction_verdict(self, fact_id, before, newly_invalid):
+    @staticmethod
+    def _stratify(candidates, rules):
+        """Strongly connected components of the candidate dependency
+        subgraph, emitted dependencies-first (Tarjan order).
+
+        Every negative edge points from a later stratum into an earlier
+        one — a negative edge inside a component would be a cycle through
+        negation, which submission rejects — so each component is a purely
+        positive least-fixed-point problem.
+        """
+        deps = {node: [] for node in candidates}
+        for rule in rules:
+            for premise, _polarity in rule["premises"]:
+                if premise in candidates:
+                    deps[rule["conclusion"]].append(premise)
+
+        index, lowlink, on_stack, stack, strata = {}, {}, set(), [], []
+        counter = 0
+        for root in sorted(deps):
+            if root in index:
+                continue
+            index[root] = lowlink[root] = counter
+            counter += 1
+            stack.append(root)
+            on_stack.add(root)
+            work = [(root, iter(sorted(deps[root])))]
+            while work:
+                node, neighbours = work[-1]
+                descended = False
+                for nxt in neighbours:
+                    if nxt not in index:
+                        index[nxt] = lowlink[nxt] = counter
+                        counter += 1
+                        stack.append(nxt)
+                        on_stack.add(nxt)
+                        work.append((nxt, iter(sorted(deps[nxt]))))
+                        descended = True
+                        break
+                    if nxt in on_stack:
+                        lowlink[node] = min(lowlink[node], index[nxt])
+                if descended:
+                    continue
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+                if lowlink[node] == index[node]:
+                    stratum = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        stratum.append(member)
+                        if member == node:
+                            break
+                    strata.append(sorted(stratum))
+        return strata
+
+    @staticmethod
+    def _wire_support(support) -> dict:
+        return {
+            "rule_id": support["rule_id"],
+            "conclusion": support["conclusion"],
+            "premises": _wire_premises(support["premises"]),
+            "status": support["status"],
+            "fire_count": support["fire_count"],
+        }
+
+    def _premise_met_now(self, premise, polarity) -> bool:
+        valid = self.store.node_valid(premise)
+        return valid if polarity == "pos" else not valid
+
+    def _invalidated_details(self, before, newly_invalid) -> list:
         newly_invalid = set(newly_invalid)
         invalidated = []
         for node in sorted(newly_invalid):
             lost = []
             for support in before.get(node, {}).get("supports", []):
                 if support["status"] == "valid":
-                    broken = [p for p in support["premises"]
-                              if not self.store.node_valid(p)]
-                    lost.append({**support, "broken_premises": broken})
+                    broken = [
+                        _wire_premise(p, pol)
+                        for p, pol in support["premises"]
+                        if not self._premise_met_now(p, pol)
+                    ]
+                    lost.append({
+                        "rule_id": support["rule_id"],
+                        "conclusion": support["conclusion"],
+                        "premises": _wire_premises(support["premises"]),
+                        "status": support["status"],
+                        "fire_count": support["fire_count"],
+                        "broken_premises": broken,
+                    })
             invalidated.append({"node": node, "lost_supports": lost})
+        return invalidated
 
+    def _build_retraction_verdict(self, fact_id, before, newly_valid,
+                                  newly_invalid):
+        newly_invalid = set(newly_invalid)
         retained = []
         for node, prior in sorted(before.items()):
             if node in newly_invalid or not prior["valid"]:
                 continue
             remaining = [
-                {"rule_id": s["rule_id"], "premises": s["premises"]}
+                {"rule_id": s["rule_id"],
+                 "premises": _wire_premises(s["premises"])}
                 for s in self.store.supports_for_conclusion(node)
                 if s["status"] == "valid"
             ]
             retained.append({"node": node, "remaining_supports": remaining})
 
-        propagation = self._propagation_chain(newly_invalid)
-        return {
+        verdict = {
             "fact_id": fact_id,
             "verdict": "retracted",
             "at": utcnow(),
-            "invalidated": invalidated,
+            "invalidated": self._invalidated_details(before, newly_invalid),
             "retained": retained,
-            "propagation": propagation,
+            "propagation": self._propagation_chain(newly_invalid),
         }
+        if newly_valid:
+            # Withdrawing a blocking fact can revive conclusions whose
+            # negative premises are satisfied again.
+            verdict["restored"] = sorted(newly_valid)
+        return verdict
 
     def _propagation_chain(self, newly_invalid) -> list:
         """Order newly invalidated conclusions into causal waves.
 
-        A node joins the chain once every one of its supports has a premise
-        that is already known invalid — i.e. its support is genuinely
-        exhausted.  Cyclic residue (mutually supporting loops) is emitted as
-        a final wave flagged `cyclic`.
+        A node joins the chain once every one of its supports is genuinely
+        exhausted: each has a positive premise already known invalid, or a
+        negative premise whose blocker is present.  Cyclic residue
+        (mutually supporting loops) is emitted as a final wave flagged
+        `cyclic`.
         """
         remaining = set(newly_invalid)
-        # Seed with everything invalid *before* this retraction (including
-        # the just-retracted fact); newly invalidated nodes join wave by
-        # wave so the chain reflects the causal order of exhaustion.
+        # Seed with everything invalid *before* this change (including a
+        # just-retracted fact); newly invalidated nodes join wave by wave
+        # so the chain reflects the causal order of exhaustion.  Present
+        # blockers need no seeding: a valid node explains a broken negative
+        # premise directly.
         invalid = self.store.invalid_nodes() - remaining
         chain = []
         depth = 0
@@ -416,8 +647,7 @@ class Engine:
             for node in sorted(remaining):
                 supports = self.store.supports_for_conclusion(node)
                 if supports and all(
-                    any(p in invalid for p in s["premises"])
-                    for s in supports
+                    self._support_defeated(s, invalid) for s in supports
                 ):
                     wave.append(node)
             if not wave:  # cyclic residue: no well-founded ordering exists
@@ -427,12 +657,38 @@ class Engine:
                                   "cause": "cyclic-support-collapsed"})
                 break
             for node in wave:
-                chain.append({"depth": depth, "node": node,
-                              "cause": "support-exhausted"})
+                blockers = self._present_blockers(node)
+                step = {"depth": depth, "node": node}
+                if blockers:
+                    step["cause"] = "negative-premise-blocked"
+                    step["blocked_by"] = blockers
+                else:
+                    step["cause"] = "support-exhausted"
+                chain.append(step)
             invalid |= set(wave)
             remaining -= set(wave)
             depth += 1
         return chain
+
+    def _support_defeated(self, support, known_invalid) -> bool:
+        """True when the support has at least one definitively unmet
+        premise: a positive premise known invalid, or a negative premise
+        whose node is present (valid) right now."""
+        for premise, polarity in support["premises"]:
+            if polarity == "neg":
+                if self.store.node_valid(premise):
+                    return True
+            elif premise in known_invalid:
+                return True
+        return False
+
+    def _present_blockers(self, node) -> list:
+        blockers = set()
+        for support in self.store.supports_for_conclusion(node):
+            for premise, polarity in support["premises"]:
+                if polarity == "neg" and self.store.node_valid(premise):
+                    blockers.add(premise)
+        return sorted(blockers)
 
     def _justify(self, node, path) -> dict:
         kind = self.store.node_kind(node)
@@ -446,11 +702,19 @@ class Engine:
                     "valid": self.store.node_valid(node)}
         supports = []
         for support in self.store.supports_for_conclusion(node):
+            premises = []
+            for premise, polarity in support["premises"]:
+                child = self._justify(premise, path + (node,))
+                if polarity == "neg":
+                    # Exception condition: satisfied exactly while the
+                    # node is absent — surface both sides of that check.
+                    child["polarity"] = "neg"
+                    child["premise_met"] = not child["valid"]
+                premises.append(child)
             supports.append({
                 "rule_id": support["rule_id"],
                 "status": support["status"],
-                "premises": [self._justify(p, path + (node,))
-                             for p in support["premises"]],
+                "premises": premises,
             })
         return {"node": node, "kind": "conclusion",
                 "valid": self.store.node_valid(node),

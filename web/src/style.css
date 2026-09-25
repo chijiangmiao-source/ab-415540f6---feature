@@ -128,6 +128,7 @@ th { color: var(--muted); font-weight: 600; }
 .fact-leaf.invalid, .fact-leaf.retracted { color: var(--bad); text-decoration: line-through; }
 .fact-leaf.asserted { color: var(--ok); }
 .broken { color: var(--bad); font-weight: 600; }
+.premise-neg { color: #92400e; font-weight: 600; }
 
 .verdict-block {
   border: 1px solid var(--line);
